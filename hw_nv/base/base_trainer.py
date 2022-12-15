@@ -140,7 +140,8 @@ class BaseTrainer:
             "arch": arch,
             "epoch": epoch,
             "state_dict": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
+            "optimizer_d": self.optimizer['optimizer_d'].state_dict(),
+            "optimizer_g": self.optimizer['optimizer_g'].state_dict(),
             "monitor_best": self.mnt_best,
             "config": self.config,
         }

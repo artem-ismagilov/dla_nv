@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from dataclasses import dataclass
-from torch.nn.utils import weight_norm, spectral_norm
+from torch.nn.utils import weight_norm, spectral_norm, remove_weight_norm
 from typing import List
 
 from hw_nv.data.melspec import MelSpectrogram
@@ -33,44 +33,10 @@ class HiFiGAN(nn.Module):
         true_melspec = batch['melspec'].to(self.device)
 
         fake_audio = self.generator(true_melspec)
-        real_audio = batch['audio'].to(self.device).unsqueeze(1)
+        true_audio = batch['audio'].to(self.device).unsqueeze(1)
 
-        optimizer_d.zero_grad()
-
-        y_df_hat_r, y_df_hat_g, _, _ = self.mp_discriminator(real_audio, fake_audio.detach())
-        loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
-
-        y_ds_hat_r, y_ds_hat_g, _, _ = self.ms_discriminator(real_audio, fake_audio.detach())
-        loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
-
-        loss_disc_all = loss_disc_s + loss_disc_f
-
-        loss_disc_all.backward()
-        optimizer_d.step()
-
-        optimizer_g.zero_grad()
-
-        fake_melspec = self.melspec(fake_audio.squeeze())
-
-        loss_mel = F.l1_loss(true_melspec, fake_melspec) * 45
-
-        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mp_discriminator(real_audio, fake_audio)
-        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.ms_discriminator(real_audio, fake_audio)
-        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-        loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-        loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-        loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
-
-        loss_gen_all.backward()
-
-        optimizer_g.step()
-
-        losses = {
-            'mel_l1_loss': loss_mel.item(),
-            'loss_disc_all': loss_disc_all.item(),
-            'loss_gen_all': loss_gen_all.item(),
-        }
+        losses = self._dicsriminator_step(optimizer_d, true_melspec, true_audio, fake_audio)
+        losses.update(self._generator_step(optimizer_g, true_melspec, true_audio, fake_audio))
 
         return losses
 
@@ -78,8 +44,58 @@ class HiFiGAN(nn.Module):
     def device(self):
         return next(iter(self.parameters())).device
 
+    def _dicsriminator_step(self, optimizer_d, true_melspec, true_audio, fake_audio):
+        optimizer_d.zero_grad()
 
-class _GeneratorConvBlock(nn.Module):
+        def get_loss(true_out, fake_out):
+            loss = 0
+            for t, f in zip(true_out, fake_out):
+                loss += torch.mean((t - 1) ** 2) + torch.mean(f ** 2)
+            return loss
+
+        true_out, fake_out, _, _ = self.mp_discriminator(true_audio, fake_audio.detach())
+        loss_mp = get_loss(true_out, fake_out)
+
+        true_out, fake_out, _, _ = self.ms_discriminator(true_audio, fake_audio.detach())
+        loss_ms = get_loss(true_out, fake_out)
+
+        loss_all = loss_ms + loss_mp
+
+        loss_all.backward()
+        optimizer_d.step()
+
+        return {
+            'discriminator_loss_all': loss_all.item(),
+            'discriminator_loss_mp': loss_mp.item(),
+            'discriminator_loss_ms': loss_ms.item(),
+        }
+
+    def _generator_step(self, optimizer_g, true_melspec, true_audio, fake_audio):
+        optimizer_g.zero_grad()
+
+        fake_melspec = self.melspec(fake_audio.squeeze())
+
+        loss_mel = F.l1_loss(true_melspec, fake_melspec) * 45
+
+        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mp_discriminator(true_audio, fake_audio)
+        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.ms_discriminator(true_audio, fake_audio)
+
+        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
+        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
+        loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
+        loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
+        loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+
+        loss_gen_all.backward()
+        optimizer_g.step()
+
+        return {
+            'mel_l1_loss': loss_mel.item(),
+            'generator_loss_all': loss_gen_all.item(),
+        }
+
+
+class _GeneratorBlock(nn.Module):
     def __init__(self, channels, kernel_size, dilations):
         super().__init__()
 
@@ -89,7 +105,7 @@ class _GeneratorConvBlock(nn.Module):
             convs1.append(
                 nn.Sequential(
                     nn.LeakyReLU(0.1),
-                    nn.Conv1d(channels, channels, kernel_size, dilation=d, padding=p),
+                    weight_norm(nn.Conv1d(channels, channels, kernel_size, dilation=d, padding=p)),
                 )
             )
         self.convs1 = nn.ModuleList(convs1)
@@ -99,7 +115,7 @@ class _GeneratorConvBlock(nn.Module):
             convs2.append(
                 nn.Sequential(
                     nn.LeakyReLU(0.1),
-                    nn.Conv1d(channels, channels, kernel_size, padding='same'),
+                    weight_norm(nn.Conv1d(channels, channels, kernel_size, padding='same')),
                 )
             )
         self.convs2 = nn.ModuleList(convs2)
@@ -117,7 +133,7 @@ class _Generator(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.first_conv = nn.Conv1d(80, config.up_channels, 7, 1, padding=3)
+        self.first_conv = weight_norm(nn.Conv1d(80, config.up_channels, 7, 1, padding=3))
 
         self.up_convs = nn.ModuleList()
         self.residual_blocks = nn.ModuleList()
@@ -127,21 +143,23 @@ class _Generator(nn.Module):
             self.up_convs.append(
                 nn.Sequential(
                     nn.LeakyReLU(0.1),
-                    nn.ConvTranspose1d(c, c // 2, k, r, padding=((k - r) // 2)),
+                    weight_norm(nn.ConvTranspose1d(c, c // 2, k, r, padding=((k - r) // 2))),
                 )
             )
 
             residuals = nn.ModuleList()
             for k, d in zip(config.residual_kernel_sizes, config.residual_dilations):
-                residuals.append(ResBlock1(c // 2, k, d))
+                residuals.append(_GeneratorBlock(c // 2, k, d))
             self.residual_blocks.append(residuals)
 
             c = c // 2
 
         self.last_conv = nn.Sequential(
             nn.LeakyReLU(0.1),
-            nn.Conv1d(c, 1, 7, 1, padding=3),
+            weight_norm(nn.Conv1d(c, 1, 7, 1, padding=3)),
         )
+
+        self.apply(init_conv_weights)
 
     def forward(self, x):
         x = self.first_conv(x)
@@ -158,6 +176,11 @@ class _Generator(nn.Module):
         return torch.tanh(x)
 
 
+def init_conv_weights(m, mean=0.0, std=0.01):
+    classname = m.__class__.__name__
+    if classname.find("Conv") != -1:
+        m.weight.data.normal_(mean, std)
+
 
 #------------------------------------------------
 
@@ -168,100 +191,6 @@ LRELU_SLOPE = 0.1
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
-
-
-class Generator(torch.nn.Module):
-    def __init__(self, config):
-        super(Generator, self).__init__()
-
-        self.num_kernels = len(config.residual_kernel_sizes)
-        self.num_upsamples = len(config.upsample_rates)
-        self.conv_pre = weight_norm(nn.Conv1d(80, config.up_channels, 7, 1, padding=3))
-        resblock = ResBlock1
-
-        self.ups = nn.ModuleList()
-        for i, (u, k) in enumerate(zip(config.upsample_rates, config.upsample_kernels)):
-            self.ups.append(weight_norm(
-                nn.ConvTranspose1d(config.up_channels//(2**i), config.up_channels//(2**(i+1)),
-                                k, u, padding=(k-u)//2)))
-
-        self.resblocks = nn.ModuleList()
-        for i in range(len(self.ups)):
-            ch = config.up_channels//(2**(i+1))
-            for j, (k, d) in enumerate(zip(config.residual_kernel_sizes, config.residual_dilations)):
-                self.resblocks.append(resblock(ch, k, d))
-
-        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
-        # self.ups.apply(init_weights)
-        # self.conv_post.apply(init_weights)
-
-    def forward(self, x):
-        print('!!!', x.shape)
-
-        x = self.conv_pre(x)
-        for i in range(self.num_upsamples):
-            x = F.leaky_relu(x, LRELU_SLOPE)
-            x = self.ups[i](x)
-            xs = None
-            for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x)
-                else:
-                    xs += self.resblocks[i*self.num_kernels+j](x)
-            x = xs / self.num_kernels
-        x = F.leaky_relu(x)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-
-        return x
-
-    def remove_weight_norm(self):
-        print('Removing weight norm...')
-        for l in self.ups:
-            remove_weight_norm(l)
-        for l in self.resblocks:
-            l.remove_weight_norm()
-        remove_weight_norm(self.conv_pre)
-        remove_weight_norm(self.conv_post)
-
-
-class ResBlock1(torch.nn.Module):
-    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock1, self).__init__()
-        self.convs1 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
-                               padding=get_padding(kernel_size, dilation[0]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
-                               padding=get_padding(kernel_size, dilation[1]))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
-                               padding=get_padding(kernel_size, dilation[2])))
-        ])
-        # self.convs1.apply(init_weights)
-
-        self.convs2 = nn.ModuleList([
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1))),
-            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                               padding=get_padding(kernel_size, 1)))
-        ])
-        # self.convs2.apply(init_weights)
-
-    def forward(self, x):
-        for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, LRELU_SLOPE)
-            xt = c1(xt)
-            xt = F.leaky_relu(xt, LRELU_SLOPE)
-            xt = c2(xt)
-            x = xt + x
-        return x
-
-    def remove_weight_norm(self):
-        for l in self.convs1:
-            remove_weight_norm(l)
-        for l in self.convs2:
-            remove_weight_norm(l)
 
 
 class DiscriminatorP(torch.nn.Module):

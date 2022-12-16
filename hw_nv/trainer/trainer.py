@@ -5,6 +5,7 @@ from random import shuffle
 import PIL
 import pandas as pd
 import torch
+import torchaudio
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torchvision.transforms import ToTensor
@@ -13,6 +14,7 @@ from tqdm.auto import tqdm
 from hw_nv.base import BaseTrainer
 from hw_nv.logger.utils import plot_spectrogram_to_buf
 from hw_nv.utils import inf_loop, MetricTracker
+from hw_nv.data.melspec import MelSpectrogram
 
 import os
 import numpy as np
@@ -50,22 +52,16 @@ class Trainer(BaseTrainer):
         self.log_step = 15
 
         self.train_metrics = MetricTracker(
-            'mel_l1_loss', 'loss_disc_all', 'loss_gen_all', writer=self.writer
+            'mel_l1_loss',
+            'generator_loss_all',
+            'discriminator_loss_all',
+            'discriminator_loss_mp',
+            'discriminator_loss_ms',
+            writer=self.writer
         )
         self.evaluation_metrics = MetricTracker(
             "loss", writer=self.writer
         )
-
-    @staticmethod
-    def move_batch_to_device(batch, device: torch.device):
-        """
-        Move all necessary tensors to the HPU
-        """
-        for tensor_for_gpu in ["spectrogram", "text_encoded"]:
-            if tensor_for_gpu not in batch:
-                continue
-            batch[tensor_for_gpu] = batch[tensor_for_gpu].to(device)
-        return batch
 
     def _clip_grad_norm(self):
         if self.config["trainer"].get("grad_norm_clip", None) is not None:
@@ -120,6 +116,10 @@ class Trainer(BaseTrainer):
         for s in self.lr_schedulers.values():
             s.step()
 
+        res = self._get_inference_results()
+        for label, wav in res.items():
+            self._log_audio(label, wav)
+
         log = last_train_metrics
         return log
 
@@ -133,7 +133,7 @@ class Trainer(BaseTrainer):
             total = self.len_epoch
         return base.format(current, total, 100.0 * current / total)
 
-    def _log_audio(self, label, wave, sr):
+    def _log_audio(self, label, wave, sr=22050):
         self.writer.add_audio(label, torch.tensor(wave), sr)
 
     @torch.no_grad()
@@ -150,29 +150,32 @@ class Trainer(BaseTrainer):
         )
         return total_norm.item()
 
-    @staticmethod
-    def synthesis(model, WaveGlow, text, fout, alpha=1.0, energy_alpha=1.0, pitch_alpha=1.0):
-        text = np.stack([text])
-        src_pos = np.array([i+1 for i in range(text.shape[1])])
-        src_pos = np.stack([src_pos])
-        sequence = torch.from_numpy(text).long().cuda()
-        src_pos = torch.from_numpy(src_pos).long().cuda()
+    @torch.no_grad()
+    def _get_inference_results(self):
+        melspec = MelSpectrogram()
 
-        with torch.no_grad():
-            mel = model.forward(sequence, src_pos, alpha=alpha, energy_alpha=energy_alpha, pitch_alpha=pitch_alpha)
-        mel = mel.contiguous().transpose(1, 2)
-        waveglow.inference.inference(mel, WaveGlow, fout)
+        self.model.eval()
 
-    @staticmethod
-    def get_test_data():
-        tests = [
-            "A defibrillator is a device that gives a high energy electric shock to the heart of someone who is in cardiac arrest.",
-            "Massachusetts Institute of Technology may be best known for its math, science and engineering education.",
-            "Wasserstein distance or Kantorovich Rubinstein metric is a distance function defined between probability distributions on a given metric space."
-        ]
-        data_list = list(text.text_to_sequence(test, ['english_cleaners']) for test in tests)
+        if not os.path.exists('test_results'):
+            os.makedirs('test_results')
 
-        return data_list
+        res = dict()
+
+        for fname in os.listdir('test_wavs'):
+            wav, sr = torchaudio.load(os.path.join('test_wavs', fname))
+
+            assert sr == 22050
+
+            label = os.path.splitext(fname)[0]
+            res[label + '_original'] = wav
+
+            with torch.no_grad():
+                mel = melspec(wav)
+                processed_wav = self.model(mel.to(self.device)).cpu().squeeze()
+
+                res[label + '_processed'] = processed_wav.clone()
+
+        return res
 
     def _log_scalars(self, metric_tracker: MetricTracker):
         if self.writer is None:

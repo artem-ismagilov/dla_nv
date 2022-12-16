@@ -114,8 +114,6 @@ class Trainer(BaseTrainer):
             if batch_idx >= self.len_epoch:
                 break
 
-            break
-
             batch_idx += 1
 
         for s in self.lr_schedulers.values():

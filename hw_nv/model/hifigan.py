@@ -21,7 +21,7 @@ class HiFiGAN(nn.Module):
         super().__init__()
 
         self.generator = _Generator(config)
-        self.mp_discriminator = MultiPeriodDiscriminator()
+        self.mp_discriminator = _MPDiscriminator()
         self.ms_discriminator = MultiScaleDiscriminator()
 
         self.melspec = MelSpectrogram()
@@ -71,22 +71,35 @@ class HiFiGAN(nn.Module):
         }
 
     def _generator_step(self, optimizer_g, true_melspec, true_audio, fake_audio):
-        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
         optimizer_g.zero_grad()
 
         fake_melspec = self.melspec(fake_audio.squeeze())
 
         loss_mel = F.l1_loss(true_melspec, fake_melspec) * 45
 
-        y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = self.mp_discriminator(true_audio, fake_audio)
-        y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = self.ms_discriminator(true_audio, fake_audio)
+        mp_true_out, mp_fake_out, mp_true_features, mp_fake_features = self.mp_discriminator(true_audio, fake_audio)
+        ms_true_out, ms_fake_out, ms_true_features, ms_fake_features = self.ms_discriminator(true_audio, fake_audio)
 
-        loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-        loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-        loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-        loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-        loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel
+        def features_loss(true_features, fake_features):
+            loss = 0
+            for ts, fs in zip(true_features, fake_features):
+                for t, f in zip(ts, fs):
+                    loss += F.l1_loss(t, f)
+            return 2 * loss
+
+        mp_features_loss = features_loss(mp_true_features, mp_fake_features)
+        ms_features_loss = features_loss(ms_true_features, ms_fake_features)
+
+        def generator_loss(fake_out):
+            loss = 0
+            for p in fake_out:
+                loss += torch.mean((1 - p) ** 2)
+            return loss
+
+        loss_gen_f = generator_loss(mp_fake_out)
+        loss_gen_s = generator_loss(ms_fake_out)
+
+        loss_gen_all = loss_gen_s + loss_gen_f + mp_features_loss + ms_features_loss + loss_mel
 
         loss_gen_all.backward()
         optimizer_g.step()
@@ -178,6 +191,65 @@ class _Generator(nn.Module):
         return torch.tanh(x)
 
 
+class _PeriodDiscriminator(nn.Module):
+    def __init__(self, period):
+        super().__init__()
+
+        self.layers = nn.ModuleList()
+
+        prev_c = 1
+        c = 32
+        for i in range(4):
+            self.layers.append(nn.Sequential(
+                weight_norm(nn.Conv2d(prev_c, c, kernel_size=(5, 1), stride=(3, 1), padding=(2, 0))),
+                nn.LeakyReLU(0.1),
+            ))
+            prev_c = c
+            c *= 2
+        self.layers.append(nn.Sequential(
+            weight_norm(nn.Conv2d(prev_c, prev_c, kernel_size=(5, 1), stride=(3, 1), padding=(2, 0))),
+            nn.LeakyReLU(0.1),
+        ))
+        self.layers.append(weight_norm(nn.Conv2d(prev_c, 1, kernel_size=(3, 1), padding=(1, 0))))
+
+        self.period = period
+
+    def forward(self, x):
+        if x.shape[2] % self.period > 0:
+            p = self.period - (x.shape[2] % self.period)
+            x = torch.nn.functional.pad(x, (0, p), 'reflect')
+
+        x = x.view(x.shape[0], 1, -1, self.period)
+        features = []
+        for l in self.layers:
+            x = l(x)
+            features.append(x)
+
+        return x.view(x.shape[0], 1, -1), features
+
+
+class _MPDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        periods = [2, 3, 5, 7, 11]
+        self.submodules = nn.ModuleList([_PeriodDiscriminator(p) for p in periods])
+
+    def forward(self, true_audio, fake_audio):
+        true_out, fake_out, true_features, fake_features = [], [], [], []
+
+        for s in self.submodules:
+            to, tf = s(true_audio)
+            true_out.append(to)
+            true_features.append(tf)
+
+            fo, ff = s(fake_audio)
+            fake_out.append(to)
+            fake_features.append(ff)
+
+        return true_out, fake_out, true_features, fake_features
+
+
 def init_conv_weights(m, mean=0.0, std=0.01):
     classname = m.__class__.__name__
     if classname.find("Conv") != -1:
@@ -193,69 +265,6 @@ LRELU_SLOPE = 0.1
 
 def get_padding(kernel_size, dilation=1):
     return int((kernel_size*dilation - dilation)/2)
-
-
-class DiscriminatorP(torch.nn.Module):
-    def __init__(self, period, kernel_size=5, stride=3, use_spectral_norm=False):
-        super(DiscriminatorP, self).__init__()
-        self.period = period
-        norm_f = weight_norm if use_spectral_norm == False else spectral_norm
-        self.convs = nn.ModuleList([
-            norm_f(nn.Conv2d(1, 32, (kernel_size, 1), (stride, 1), padding=(get_padding(5, 1), 0))),
-            norm_f(nn.Conv2d(32, 128, (kernel_size, 1), (stride, 1), padding=(get_padding(5, 1), 0))),
-            norm_f(nn.Conv2d(128, 512, (kernel_size, 1), (stride, 1), padding=(get_padding(5, 1), 0))),
-            norm_f(nn.Conv2d(512, 1024, (kernel_size, 1), (stride, 1), padding=(get_padding(5, 1), 0))),
-            norm_f(nn.Conv2d(1024, 1024, (kernel_size, 1), 1, padding=(2, 0))),
-        ])
-        self.conv_post = norm_f(nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
-
-    def forward(self, x):
-        fmap = []
-
-        # 1d to 2d
-        b, c, t = x.shape
-        if t % self.period != 0: # pad first
-            n_pad = self.period - (t % self.period)
-            x = F.pad(x, (0, n_pad), "reflect")
-            t = t + n_pad
-        x = x.view(b, c, t // self.period, self.period)
-
-        for l in self.convs:
-            x = l(x)
-            x = F.leaky_relu(x, LRELU_SLOPE)
-            fmap.append(x)
-        x = self.conv_post(x)
-        fmap.append(x)
-        x = torch.flatten(x, 1, -1)
-
-        return x, fmap
-
-
-class MultiPeriodDiscriminator(torch.nn.Module):
-    def __init__(self):
-        super(MultiPeriodDiscriminator, self).__init__()
-        self.discriminators = nn.ModuleList([
-            DiscriminatorP(2),
-            DiscriminatorP(3),
-            DiscriminatorP(5),
-            DiscriminatorP(7),
-            DiscriminatorP(11),
-        ])
-
-    def forward(self, y, y_hat):
-        y_d_rs = []
-        y_d_gs = []
-        fmap_rs = []
-        fmap_gs = []
-        for i, d in enumerate(self.discriminators):
-            y_d_r, fmap_r = d(y)
-            y_d_g, fmap_g = d(y_hat)
-            y_d_rs.append(y_d_r)
-            fmap_rs.append(fmap_r)
-            y_d_gs.append(y_d_g)
-            fmap_gs.append(fmap_g)
-
-        return y_d_rs, y_d_gs, fmap_rs, fmap_gs
 
 
 class DiscriminatorS(torch.nn.Module):
@@ -316,37 +325,3 @@ class MultiScaleDiscriminator(torch.nn.Module):
             fmap_gs.append(fmap_g)
 
         return y_d_rs, y_d_gs, fmap_rs, fmap_gs
-
-
-def feature_loss(fmap_r, fmap_g):
-    loss = 0
-    for dr, dg in zip(fmap_r, fmap_g):
-        for rl, gl in zip(dr, dg):
-            loss += torch.mean(torch.abs(rl - gl))
-
-    return loss*2
-
-
-def discriminator_loss(disc_real_outputs, disc_generated_outputs):
-    loss = 0
-    r_losses = []
-    g_losses = []
-    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1-dr)**2)
-        g_loss = torch.mean(dg**2)
-        loss += (r_loss + g_loss)
-        r_losses.append(r_loss.item())
-        g_losses.append(g_loss.item())
-
-    return loss, r_losses, g_losses
-
-
-def generator_loss(disc_outputs):
-    loss = 0
-    gen_losses = []
-    for dg in disc_outputs:
-        l = torch.mean((1-dg)**2)
-        gen_losses.append(l)
-        loss += l
-
-    return loss, gen_losses

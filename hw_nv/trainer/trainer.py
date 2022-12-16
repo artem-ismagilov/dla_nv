@@ -62,9 +62,6 @@ class Trainer(BaseTrainer):
             'discriminator_loss_ms',
             writer=self.writer
         )
-        self.evaluation_metrics = MetricTracker(
-            "val_loss", writer=self.writer
-        )
 
     def _clip_grad_norm(self):
         if self.config["trainer"].get("grad_norm_clip", None) is not None:
@@ -125,9 +122,6 @@ class Trainer(BaseTrainer):
 
         log = last_train_metrics
 
-        val_log = self._eval_epoch()
-        log.update(**{name: value for name, value in val_log.items()})
-
         return log
 
     def _progress(self, batch_idx):
@@ -179,27 +173,6 @@ class Trainer(BaseTrainer):
                 res[label + '_processed'] = processed_wav.clone()
 
         return res
-
-    @torch.no_grad()
-    def _eval_epoch(self):
-        self.evaluation_metrics.reset()
-
-        self.model.eval()
-
-        melspec = MelSpectrogram()
-
-        loss = 0
-        n_samples = 0
-        for batch in tqdm(self.val_dataloader):
-            pred = self.model(batch['melspec'].to(self.device)).cpu()
-            fake_mel = melspec(pred)
-
-            n_samples += batch['melspec'].shape[0]
-            loss += torch.mean(torch.abs(fake_mel - batch['melspec'])) * batch['melspec'].shape[0]
-
-        self.evaluation_metrics.update('val_loss', loss / n_samples)
-
-        return self.evaluation_metrics.result()
 
     def _log_scalars(self, metric_tracker: MetricTracker):
         if self.writer is None:

@@ -32,7 +32,8 @@ class Trainer(BaseTrainer):
             optimizers,
             config,
             device,
-            dataloader,
+            train_dataloader,
+            val_dataloader,
             lr_schedulers=None,
             len_epoch=None,
             skip_oom=True,
@@ -40,7 +41,9 @@ class Trainer(BaseTrainer):
         super().__init__(model, criterion, optimizers, config, device)
         self.skip_oom = skip_oom
         self.config = config
-        self.train_dataloader = dataloader
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+
         if len_epoch is None:
             # epoch-based training
             self.len_epoch = len(self.train_dataloader)
@@ -60,7 +63,7 @@ class Trainer(BaseTrainer):
             writer=self.writer
         )
         self.evaluation_metrics = MetricTracker(
-            "loss", writer=self.writer
+            "val_loss", writer=self.writer
         )
 
     def _clip_grad_norm(self):
@@ -111,6 +114,8 @@ class Trainer(BaseTrainer):
             if batch_idx >= self.len_epoch:
                 break
 
+            break
+
             batch_idx += 1
 
         for s in self.lr_schedulers.values():
@@ -121,6 +126,10 @@ class Trainer(BaseTrainer):
             self._log_audio(label, wav)
 
         log = last_train_metrics
+
+        val_log = self._eval_epoch()
+        log.update(**{name: value for name, value in val_log.items()})
+
         return log
 
     def _progress(self, batch_idx):
@@ -156,11 +165,7 @@ class Trainer(BaseTrainer):
 
         self.model.eval()
 
-        if not os.path.exists('test_results'):
-            os.makedirs('test_results')
-
         res = dict()
-
         for fname in os.listdir('test_wavs'):
             wav, sr = torchaudio.load(os.path.join('test_wavs', fname))
 
@@ -176,6 +181,27 @@ class Trainer(BaseTrainer):
                 res[label + '_processed'] = processed_wav.clone()
 
         return res
+
+    @torch.no_grad()
+    def _eval_epoch(self):
+        self.evaluation_metrics.reset()
+
+        self.model.eval()
+
+        melspec = MelSpectrogram()
+
+        loss = 0
+        n_samples = 0
+        for batch in tqdm(self.val_dataloader):
+            pred = self.model(batch['melspec'].to(self.device)).cpu()
+            fake_mel = melspec(pred)
+
+            n_samples += batch['melspec'].shape[0]
+            loss += torch.mean(torch.abs(fake_mel - batch['melspec'])) * batch['melspec'].shape[0]
+
+        self.evaluation_metrics.update('val_loss', loss / n_samples)
+
+        return self.evaluation_metrics.result()
 
     def _log_scalars(self, metric_tracker: MetricTracker):
         if self.writer is None:

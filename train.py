@@ -36,6 +36,14 @@ def main(config):
         collate_fn=dataset.collate
     )
 
+    val_dataset = config.init_obj(config['val_dataset'], module_data)
+    val_data_loader = config.init_obj(
+        config['val_dataloader'],
+        torch.utils.data,
+        dataset=val_dataset,
+        collate_fn=val_dataset.collate
+    )
+
     # build model architecture, then print to console
     model = config.init_obj(config["arch"], module_arch)
     logger.info(model)
@@ -76,7 +84,8 @@ def main(config):
         optimizers,
         config=config,
         device=device,
-        dataloader=train_data_loader,
+        train_dataloader=train_data_loader,
+        val_dataloader=val_data_loader,
         lr_schedulers=lr_schedulers,
         len_epoch=config["trainer"].get("len_epoch", None)
     )

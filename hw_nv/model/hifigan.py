@@ -71,6 +71,8 @@ class HiFiGAN(nn.Module):
         }
 
     def _generator_step(self, optimizer_g, true_melspec, true_audio, fake_audio):
+        #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
         optimizer_g.zero_grad()
 
         fake_melspec = self.melspec(fake_audio.squeeze())

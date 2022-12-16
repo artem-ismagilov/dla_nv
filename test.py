@@ -12,7 +12,6 @@ if __name__ == '__main__':
 
     model = HiFiGAN().to(device).eval()
     model.load_state_dict(torch.load('eval_model.pth', map_location=device)['state_dict'])
-    model.generator.remove_weight_norm()
 
     melspec = MelSpectrogram()
 

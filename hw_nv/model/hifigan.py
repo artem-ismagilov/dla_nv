@@ -96,10 +96,10 @@ class HiFiGAN(nn.Module):
                 loss += torch.mean((1 - p) ** 2)
             return loss
 
-        loss_gen_f = generator_loss(mp_fake_out)
-        loss_gen_s = generator_loss(ms_fake_out)
+        mp_out_loss = generator_loss(mp_fake_out)
+        ms_out_loss = generator_loss(ms_fake_out)
 
-        loss_gen_all = loss_gen_s + loss_gen_f + mp_features_loss + ms_features_loss + loss_mel
+        loss_gen_all = mp_out_loss + ms_out_loss + mp_features_loss + ms_features_loss + loss_mel
 
         loss_gen_all.backward()
         optimizer_g.step()
@@ -244,7 +244,7 @@ class _MPDiscriminator(nn.Module):
             true_features.append(tf)
 
             fo, ff = s(fake_audio)
-            fake_out.append(to)
+            fake_out.append(fo)
             fake_features.append(ff)
 
         return true_out, fake_out, true_features, fake_features

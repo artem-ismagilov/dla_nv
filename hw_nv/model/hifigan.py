@@ -18,10 +18,13 @@ class HiFiGANConfig:
 
 
 class HiFiGAN(nn.Module):
-    def __init__(self, config = HiFiGANConfig()):
+    def __init__(self, up_channels = None, config = HiFiGANConfig()):
         super().__init__()
+        self.config = config
+        if up_channels is not None:
+            self.config.up_channels = up_channels
 
-        self.generator = _Generator(config)
+        self.generator = _Generator(self.config)
         self.mp_discriminator = _MPDiscriminator()
         self.ms_discriminator = _MSDiscriminator()
 
